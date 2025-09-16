@@ -59,7 +59,7 @@ class DatetimeColumnDescription(BaseModel):
         )
 
 
-def get_column_context(series: pd.Series) -> ColumnDescription | None:
+def get_column_description(series: pd.Series) -> ColumnDescription | None:
     if is_numeric_dtype(series.dtype):
         return NumberColumnDescription.from_series(series)
     elif is_datetime64_any_dtype(series.dtype):
@@ -78,7 +78,7 @@ class ColumnContext(BaseModel):
 
     @classmethod
     def from_series(cls, series: pd.Series) -> Self:
-        column_details = get_column_context(series)
+        column_details = get_column_description(series)
         return cls(
             name=str(series.name),
             unique=series.nunique(),

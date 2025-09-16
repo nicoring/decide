@@ -88,19 +88,7 @@ def check_columns(df: pd.DataFrame, name: str, *cols: str) -> None:
 
 
 @agent.tool
-def get_dataframe_names(ctx: RunContext[DataStore]) -> list[str]:
-    """
-    Get the names of the dataframes
-
-    Returns:
-        list[str]
-            contains the names of the dataframes
-    """
-    return ctx.deps.keys()
-
-
-@agent.tool
-def get_columns(ctx: RunContext[DataStore], name: str) -> list[str]:
+def get_dataframe_columns(ctx: RunContext[DataStore], name: str) -> list[str]:
     """
     Get the columns of a dataframe
 
@@ -144,28 +132,6 @@ def delete_dataframe(ctx: RunContext[DataStore], name: str) -> None:
     ctx.deps.delete(name)
 
 
-@agent.tool
-def get_correlation(ctx: RunContext[DataStore], name: str, col1: str, col2: str) -> str:
-    """
-    Get the correlation between two columns
-
-    Args:
-        name
-            the name of the dataframe
-        col1
-            the first column to get the correlation between
-        col2
-            the second column to get the correlation between
-
-    Returns:
-        str
-            contains the correlation between the two columns
-    """
-    df = ctx.deps.get(name)
-    check_columns(df, name, col1, col2)
-    return df[[col1, col2]].corr().to_string()
-
-
 @agent.tool(retries=3)
 def run_duckdb_query(
     ctx: RunContext[DataStore],
@@ -176,7 +142,7 @@ def run_duckdb_query(
     description: str | None = None,
 ) -> DataframeContext:
     """
-    Run a DuckDB query on a dataframe.
+    Run a DuckDB query on a dataframe, the result is stored as a new dataframe.
 
     Args:
         name
