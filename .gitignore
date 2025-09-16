@@ -1,0 +1,51 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# VSCode settings
+.vscode/
+
+# MacOS files
+.DS_Store
+
+# Log files
+*.log
+
+# Test and coverage outputs
+htmlcov/
+.tox/
+.coverage
+.cache
+pytest_cache/
+.nox/
+
+# MyPy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Streamlit
+.streamlit/
+
+# DuckDB database files
+*.duckdb
+
+# Local data
+data/*
+*.csv
+*.parquet
+*.xlsx
