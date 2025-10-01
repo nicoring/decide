@@ -8,7 +8,7 @@ Decide is a Streamlit-based data analysis assistant that lets you chat with your
 
 - Python 3.9+
 - [Ollama](https://ollama.com/) running locally (for LLM inference)
-- [uv](https://github.com/astral-sh/uv) (for fast Python dependency management)
+- [uv](https://github.com/astral-sh/uv) (Python dependency management)
 
 ### 2. Run LLM locally
 

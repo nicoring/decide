@@ -1,4 +1,4 @@
-from typing import AsyncIterable, Literal
+from typing import AsyncIterable, Literal, TypedDict
 
 import logfire
 import streamlit as st
@@ -17,7 +17,17 @@ from pydantic_ai.messages import (
 import pandas as pd
 
 from decide.agent import agent
-from decide.storage import DataStore
+from decide.storage import DataStore, ModelData, SQLData
+
+
+class SessionState:
+    messages: list[ModelMessage]
+    datastore: DataStore
+
+    def __contains__(self, item: str) -> bool:
+        raise NotImplementedError("Only for type checking")
+
+SESSION_STATE: SessionState = st.session_state # type: ignore
 
 
 class ChatMessage(BaseModel):
@@ -29,10 +39,10 @@ class ChatMessage(BaseModel):
 
 def initialize_session_state():
     """Initialize session state variables for the chat application."""
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "datastore" not in st.session_state:
-        st.session_state.datastore = DataStore()
+    if "messages" not in SESSION_STATE:
+        SESSION_STATE.messages = []
+    if "datastore" not in SESSION_STATE:
+        SESSION_STATE.datastore = DataStore()
 
 
 def to_chat_message(m: ModelMessage) -> ChatMessage | None:
@@ -68,7 +78,7 @@ def to_chat_message(m: ModelMessage) -> ChatMessage | None:
 
 def display_chat_history():
     """Display the entire chat history using Streamlit chat messages."""
-    for message in st.session_state.messages:
+    for message in SESSION_STATE.messages:
         logfire.debug("Raw message: {message}", message=message)
         chat_message = to_chat_message(message)
 
@@ -83,7 +93,7 @@ def display_chat_history():
 
 def clear_chat_history():
     """Clear the chat history."""
-    st.session_state.messages = []
+    SESSION_STATE.messages = []
     st.rerun()
 
 
@@ -126,17 +136,23 @@ def build_data_viewer() -> None:
     """Build the data viewer interface."""
     st.header("📊 Data Viewer")
 
-    names = st.session_state.datastore.keys()
+    names = SESSION_STATE.datastore.keys()
     tabs = st.tabs(names)
     for name, tab in zip(names, tabs):
-        df = st.session_state.datastore.get(name)
-        context = st.session_state.datastore.get_context(name)
+        data = SESSION_STATE.datastore.get(name)
         with tab:
-            st.write(context.description)
-            if context.sql is not None:
-                with st.expander("🔍 View SQL"):
-                    st.code(context.sql, language="sql")
-            st.dataframe(df, width="stretch")
+            st.write(data.description)
+            match data:
+                case SQLData():
+                    st.write("Inputs: " + ", ".join(data.input_data))
+                    with st.expander("🔍 View SQL"):
+                        st.code(data.sql, language="sql")
+                case ModelData():
+                    st.write("Input: " + data.input_data)
+                    with st.expander("🔍 View Model"):
+                        st.code(str(data.model))
+
+            st.dataframe(data.df, width="stretch")
 
 
 async def handle_events(_, event_stream: AsyncIterable[AgentStreamEvent]) -> None:
@@ -170,8 +186,8 @@ def build_chat() -> None:
                 with st.status("🤔 Analyzing your data..."):
                     response = agent.run_sync(
                         user_prompt=prompt,
-                        deps=st.session_state.datastore,
-                        message_history=st.session_state.messages,
+                        deps=SESSION_STATE.datastore,
+                        message_history=SESSION_STATE.messages,
                         event_stream_handler=handle_events,
                     )
             except Exception as e:
@@ -181,7 +197,7 @@ def build_chat() -> None:
                 st.error(error_message)
                 st.exception(e)
             else:
-                st.session_state.messages.extend(response.new_messages())
+                SESSION_STATE.messages.extend(response.new_messages())
                 for message in response.new_messages():
                     logfire.debug("Message: {message}", message=message)
                     chat_message = to_chat_message(message)
@@ -208,10 +224,10 @@ def build_page() -> None:
 
     data = build_upload_file()
     if data is not None:
-        if "initial" not in st.session_state.datastore:
-            st.session_state.datastore.store(
-                data,
-                "initial",
+        if "initial" not in SESSION_STATE.datastore:
+            SESSION_STATE.datastore.store_static(
+                df=data,
+                name="initial",
                 description="The initial dataframe, uploaded by the user.",
             )
         container = st.container()

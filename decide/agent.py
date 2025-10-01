@@ -2,9 +2,10 @@ from typing import Any, Callable, Literal
 
 import duckdb
 import sqlfluff
+from pydantic import BaseModel
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import Model, OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
 import pandas as pd
@@ -12,26 +13,83 @@ import pandas as pd
 import statsmodels.formula.api as smf
 
 from decide.config import settings
-from decide.storage import DataframeContext, DataStore
+from decide.model import EstimatorSchema, EstimatorSchemaAdapter, build_estimator
+from decide.storage import DataStore
 
 
-def build_agent() -> Agent[DataStore]:
-    model = OpenAIChatModel(
+def build_model(temperature: float) -> Model:
+    return OpenAIChatModel(
         model_name=settings.model_name,
         provider=OllamaProvider(base_url=settings.ollama_url),
         settings={
-            "temperature": settings.temperature,
+            "temperature": temperature,
         },
     )
-    agent = Agent(
-        model=model,
-        deps_type=DataStore,
-        tools=[duckduckgo_search_tool()],
-    )
-    return agent
 
 
-agent = build_agent()
+_model = build_model(temperature=settings.temperature)
+_model_agent_model = build_model(temperature=0.0)  # Use zero temperature for reliable structured output
+
+agent = Agent(
+    model=_model,
+    deps_type=DataStore,
+    tools=[duckduckgo_search_tool()],
+)
+
+
+class ModelFailure(BaseModel):
+    """An unrecoverable failure. Only use this when the prompt requested an invalid model."""
+
+    explanation: str
+
+model_agent = Agent[None, EstimatorSchema | ModelFailure](
+    name="model_agent",
+    system_prompt=f"""
+You are a model agent that builds scikit-learn models from natural language prompts.
+
+Your task is to output ONLY valid JSON matching the EstimatorSchema.
+
+CRITICAL RULES:
+1. Output ONLY valid JSON - no markdown, no code blocks, no explanations
+2. Always include the "kind" field as the discriminator
+3. For simple models, use the appropriate kind: "regressor", "classifier", "transformer", "decomposer", or "imputer"
+4. For complex models with multiple steps, use "pipeline" with a list of steps
+
+VALID OUTPUT EXAMPLES:
+
+For "linear regression":
+{{"kind": "regressor", "name": "LinearRegression"}}
+
+For "logistic regression":
+{{"kind": "classifier", "name": "LogisticRegression"}}
+
+For "ridge regression":
+{{"kind": "regressor", "name": "Ridge"}}
+
+For "lasso regression":
+{{"kind": "regressor", "name": "Lasso"}}
+
+For "random forest classifier":
+{{"kind": "classifier", "name": "RandomForestClassifier"}}
+
+For "support vector classifier":
+{{"kind": "classifier", "name": "SVC"}}
+
+For a pipeline with scaling and regression:
+{{"kind": "pipeline", "steps": [{{"kind": "transformer", "name": "StandardScaler"}}, {{"kind": "regressor", "name": "LinearRegression"}}]}}
+
+For unsupported models (e.g., decision trees, neural networks):
+{{"explanation": "Decision tree classifiers are not supported."}}
+
+FULL SCHEMA FOR REFERENCE:
+{EstimatorSchemaAdapter.json_schema()}
+
+Remember: Output ONLY the JSON object, nothing else.
+    """,
+    model=_model_agent_model,
+    output_type=EstimatorSchema | ModelFailure,
+    output_retries=3,
+)
 
 
 @agent.system_prompt
@@ -100,11 +158,11 @@ def get_dataframe_columns(ctx: RunContext[DataStore], name: str) -> list[str]:
         list[str]
             contains the columns of the dataframe
     """
-    return ctx.deps.get(name).columns.tolist()
+    return ctx.deps.get_data(name).columns.tolist()
 
 
 @agent.tool
-def get_dataframe_context(ctx: RunContext[DataStore], name: str) -> DataframeContext:
+def get_dataframe_context(ctx: RunContext[DataStore], name: str) -> str:
     """
     Get the full context of a dataframe with metadata
 
@@ -113,11 +171,12 @@ def get_dataframe_context(ctx: RunContext[DataStore], name: str) -> DataframeCon
             the name of the dataframe
 
     Returns:
-        DataframeContext
+        str
             the context with metadata of the dataframe including the name, length, columns, description, and sql
             as well as the context of each column where applicable (number, categorical, datetime).
     """
-    return ctx.deps.get_context(name)
+    context = ctx.deps.get_context(name)
+    return context
 
 
 @agent.tool
@@ -135,44 +194,54 @@ def delete_dataframe(ctx: RunContext[DataStore], name: str) -> None:
 @agent.tool(retries=3)
 def run_duckdb_query(
     ctx: RunContext[DataStore],
-    name: str,
+    names: list[str],
     new_name: str,
     sql: str,
+    description: str,
     replace: bool = False,
-    description: str | None = None,
-) -> DataframeContext:
+) -> str:
     """
-    Run a DuckDB query on a dataframe, the result is stored as a new dataframe.
+    Run a DuckDB query on set of dataframes, the result is stored as a new dataframe.
 
     Args:
-        name
-            the name of the dataframe. This dataframe is accessible as a table with the same name in the query.
+        names
+            the names of the dataframes. These dataframes are accessible as tables with the same name in the query.
         new_name
             the name of the new dataframe to store the result of the DuckDB query.
         sql
-            the DuckDB query to run. This query is executed using the duckdb.query_df function.
-        replace
-            whether to replace an existing dataframe with the same name
+            the DuckDB query to run. This query is executed using the duckdb.query_df function. MUST comply with the duckdb syntax.
         description
             the description of the new dataframe that is stored in the context and be used later.
+        replace
+            whether to replace an existing dataframe with the same name
     Returns:
-        DataframeContext
+        str
             the context with metadata of the new dataframe that is stored under the given name.
     """
-
-    check_columns(ctx.deps.get(name), name)
     if new_name in ctx.deps and not replace:
         raise ModelRetry(
             f"Error: {new_name} is already a valid dataframe. Check the previous messages and try again."
         )
-    data = ctx.deps.get(name)
     sql_query = sqlfluff.fix(sql, dialect="duckdb")
+
+    conn = duckdb.connect()
+    for name in names:
+        data = ctx.deps.get_data(name)
+        conn.register(name, data)
     try:
-        result = duckdb.query_df(df=data, virtual_table_name=name, sql_query=sql).df()
+        result = conn.sql(sql).df()
     except Exception as e:
         raise ModelRetry(f"Error: {e}. Check the previous messages and try again.")
-    name = ctx.deps.store(result, new_name, sql=sql_query, description=description)
-    context = ctx.deps.get_context(name)
+    finally:
+        conn.close()
+    sql_data = ctx.deps.store_sql(
+        df=result,
+        name=new_name,
+        input_data=names,
+        sql=sql_query,
+        description=description,
+    )
+    context = sql_data.get_context()
     return context
 
 
@@ -185,7 +254,7 @@ def head(ctx: RunContext[DataStore], name: str) -> str:
         name
             the name of the dataframe
     """
-    return ctx.deps.get(name).head(5).to_string()
+    return ctx.deps.get_data(name).head(5).to_string()
 
 
 def try_statsmodels(
@@ -242,7 +311,7 @@ def statsmodels_regression(
         str
             the summary of the regression
     """
-    df = ctx.deps.get(name)
+    df = ctx.deps.get_data(name)
     model = getattr(smf, regression_type)
     return try_statsmodels(model, formula, df)
 
@@ -254,5 +323,88 @@ def statsmodels_mixedlm_regression(
     """
     Run a statsmodels MixedLM regression
     """
-    df = ctx.deps.get(name)
+    df = ctx.deps.get_data(name)
     return try_statsmodels(smf.mixedlm, formula, df, kwargs={"groups": df[group_col]})
+
+
+@agent.tool(retries=3)
+async def fit_model(
+    ctx: RunContext[DataStore],
+    name: str,
+    features: list[str],
+    target: str,
+    model_prompt: str,
+    description: str,
+) -> str:
+    """
+    Fit a scikit learn model to a dataframe, using a natural language prompt to describe the desired model or pipeline.
+
+    This tool allows you to specify, in plain English, the type of model or modeling pipeline you want to fit (e.g., regression, classification, feature engineering, or a combination thereof). The prompt will be interpreted by a sub-agent, which will generate a structured model specification and fit it to the provided dataframe.
+
+    Usage:
+        - Use this tool when you want to fit a model or pipeline to a dataframe, but do not want to specify the exact model code.
+        - The features and target variables must be specified in the context of the dataframe.
+        - The model_prompt should clearly describe the modeling goal and any special requirements (e.g., regularization, feature selection, etc.). It should not mention any specifics of how to fit the model this will be done byt this tool call.
+        - The dataframe to use must already exist in the context under the given name.
+
+    Args:
+        name (str): The name of the dataframe to use for modeling. This must match one of the available dataframes in the context.
+        features (list[str]): The features to use for modeling. This must be a list of columns in the dataframe.
+        target (str): The target variable to predict. This must be a column in the dataframe.
+        model_prompt (str): A natural language description of the model or modeling pipeline to fit. Be as specific as possible about the modeling objective, variables, and any constraints or preferences. Do not give instructions, just describe the model.
+        description (str): A description of the model to store in the context.
+    Returns:
+        str: Metadata and context for the predictions, which are automatically stored as a new dataframe named "{name}_predictions".
+            - The returned context includes information about the predictions and the model used.
+            - The predictions dataframe can be accessed using the new name.
+
+    Notes:
+        - If the model_prompt is invalid or cannot be translated into a valid model, an error will be raised.
+        - The tool supports complex pipelines, including transformers and multiple modeling steps.
+    """
+    data = ctx.deps.get(name)
+    df = data.df
+    check_columns(df, name, *features, target)
+
+    feature_metadata = [
+        col.model_dump_json() for col in data.context.columns if col.name in features
+    ]
+    target_metadata = [
+        col.model_dump_json() for col in data.context.columns if col.name == target
+    ][0]
+
+    prompt = f"""
+    Generate a model schema for a model that predicts the target variable {target} using the following features: {features}.
+
+    Metadata for the features: {feature_metadata}
+    Metadata for the target: {target_metadata}
+
+    The model is described as follows:
+    {model_prompt}
+
+    DO NOT include any other text than the model schema.
+    """
+
+    result = await model_agent.run(prompt)
+    output = result.output
+    if isinstance(output, ModelFailure):
+        raise ModelRetry(
+            f"Error: {output.explanation}. Check the previous messages and try again."
+        )
+    estimator = build_estimator(output)
+    try:
+        estimator.fit(df[features], df[target])
+        predictions = estimator.predict(df[features])
+    except Exception as e:
+        raise ModelRetry(
+            f"Error fitting the model: {e}. Check the previous messages and try again."
+        )
+    data = ctx.deps.store_model(
+        df=pd.DataFrame(predictions, columns=["predicted_" + target]),
+        name=f"{name}_predictions",
+        description=description,
+        input_data=name,
+        model=estimator,
+    )
+    context = data.get_context()
+    return context
