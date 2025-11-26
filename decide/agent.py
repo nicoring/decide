@@ -1,13 +1,17 @@
 from typing import Any, Callable, Literal
 
+import arviz as az
 import duckdb
+import pymc as pm
 import sqlfluff
 from pydantic import BaseModel
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.models.openai import Model, OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
+import logfire
 
+import numpy as np
 import pandas as pd
 
 import statsmodels.formula.api as smf
@@ -15,6 +19,7 @@ import statsmodels.formula.api as smf
 from decide.config import settings
 from decide.model import EstimatorSchema, EstimatorSchemaAdapter, build_estimator
 from decide.storage import DataStore
+from decide.validation import execute_validated_code
 
 
 def build_model(temperature: float) -> Model:
@@ -41,6 +46,19 @@ class ModelFailure(BaseModel):
     """An unrecoverable failure. Only use this when the prompt requested an invalid model."""
 
     explanation: str
+
+
+class BayesianModelCode(BaseModel):
+    """Generated PyMC model code."""
+
+    code: str
+
+
+class BayesianModelFailure(BaseModel):
+    """An unrecoverable failure. Only use this when the prompt requested an invalid Bayesian model."""
+
+    explanation: str
+
 
 model_agent = Agent[None, EstimatorSchema | ModelFailure](
     name="model_agent",
@@ -88,6 +106,269 @@ Remember: Output ONLY the JSON object, nothing else.
     """,
     model=_model_agent_model,
     output_type=EstimatorSchema | ModelFailure,
+    output_retries=3,
+)
+
+
+bayesian_agent = Agent[None, BayesianModelCode | BayesianModelFailure](
+    name="bayesian_agent",
+    system_prompt="""
+You are a Bayesian modeling expert that generates PyMC model code from natural language descriptions.
+
+Your task is to output ONLY valid Python code that defines a function called `build_model`.
+
+CRITICAL RULES:
+1. Output ONLY Python code - no markdown, no code blocks, no explanations
+2. The code must define a function: `def build_model(df, features, target):`
+3. The function must return a PyMC model object
+4. DO NOT include any import statements - pm, np, and pd are already available as globals
+5. Use modern PyMC syntax with pm (not pymc)
+6. The model should use the provided df, features, and target parameters
+
+FUNCTION SIGNATURE:
+```python
+def build_model(df, features, target):
+    # pm, np, and pd are already available
+    # IMPORTANT: Convert all features to numeric - PyMC cannot handle object dtypes
+    # Use .astype('category').cat.codes for categorical/string columns
+    # Your model code here
+    return model
+```
+
+DATA TYPE HANDLING:
+- PyMC requires numeric arrays - ALWAYS convert object/string columns to numeric codes
+- For categorical variables: use df[col].astype('category').cat.codes.values
+- For numeric columns: use df[col].values directly
+- Check the metadata to determine column types
+
+CRITICAL - DATA STANDARDIZATION:
+- ALWAYS standardize continuous predictors: X_scaled = (X - X.mean()) / X.std()
+- This dramatically improves sampler convergence and mixing
+- Do NOT standardize binary variables (0/1) or categorical codes
+- Standardization is essential for hierarchical models
+
+EXAMPLE OUTPUTS:
+
+For "linear regression with normal priors" (all numeric features):
+```python
+def build_model(df, features, target):
+    # Convert to numpy arrays, ensuring numeric dtype
+    X = df[features].select_dtypes(include=[np.number]).values.astype(float)
+
+    # Standardize features for better convergence
+    X_mean = X.mean(axis=0)
+    X_std = X.std(axis=0)
+    X_scaled = (X - X_mean) / (X_std + 1e-8)
+
+    y = df[target].values.astype(float)
+
+    with pm.Model() as model:
+        # Priors (tighter for standardized data)
+        alpha = pm.Normal('intercept', mu=0, sigma=2)
+        beta = pm.Normal('coefficients', mu=0, sigma=2, shape=X.shape[1])
+        sigma = pm.HalfNormal('sigma', sigma=1)
+
+        # Linear model
+        mu = alpha + pm.math.dot(X_scaled, beta)
+
+        # Likelihood
+        y_obs = pm.Normal('y_obs', mu=mu, sigma=sigma, observed=y)
+
+    return model
+```
+
+For "logistic regression" (numeric features):
+```python
+def build_model(df, features, target):
+    X = df[features].select_dtypes(include=[np.number]).values.astype(float)
+
+    # Standardize features
+    X_mean = X.mean(axis=0)
+    X_std = X.std(axis=0)
+    X_scaled = (X - X_mean) / (X_std + 1e-8)
+
+    y = df[target].values.astype(int)
+
+    with pm.Model() as model:
+        # Priors (tighter for standardized data)
+        alpha = pm.Normal('intercept', mu=0, sigma=2)
+        beta = pm.Normal('coefficients', mu=0, sigma=2, shape=X.shape[1])
+
+        # Logistic model
+        p = pm.math.invlogit(alpha + pm.math.dot(X_scaled, beta))
+
+        # Likelihood
+        y_obs = pm.Bernoulli('y_obs', p=p, observed=y)
+
+    return model
+```
+
+For "hierarchical logistic regression with group effects":
+```python
+def build_model(df, features, target):
+    # Note: Pclass should NOT be in features list, access it directly from df
+    groups = df['Pclass'].astype('category').cat.codes.values
+    n_groups = len(df['Pclass'].unique())
+
+    # Process features
+    X_list = []
+    is_continuous = []
+
+    for col in features:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            x_col = df[col].values.astype(float)
+            is_continuous.append(len(np.unique(x_col)) > 10)
+            X_list.append(x_col)
+        else:
+            X_list.append(df[col].astype('category').cat.codes.values.astype(float))
+            is_continuous.append(False)
+
+    X = np.column_stack(X_list)
+
+    # Standardize continuous features only
+    X_scaled = X.copy()
+    for i, is_cont in enumerate(is_continuous):
+        if is_cont:
+            X_scaled[:, i] = (X[:, i] - X[:, i].mean()) / (X[:, i].std() + 1e-8)
+
+    y = df[target].values.astype(int)
+
+    with pm.Model() as model:
+        # Hyperpriors (tighter for standardized data)
+        mu_alpha = pm.Normal('mu_alpha', mu=0, sigma=2)
+        sigma_alpha = pm.HalfNormal('sigma_alpha', sigma=1)
+
+        # Non-centered parameterization for group intercepts
+        alpha_offset = pm.Normal('alpha_offset', mu=0, sigma=1, shape=n_groups)
+        alpha = pm.Deterministic('alpha', mu_alpha + alpha_offset * sigma_alpha)
+
+        # Global slopes
+        beta = pm.Normal('beta', mu=0, sigma=2, shape=X.shape[1])
+
+        # Logistic model
+        p = pm.math.invlogit(alpha[groups] + pm.math.dot(X_scaled, beta))
+
+        # Likelihood
+        y_obs = pm.Bernoulli('y_obs', p=p, observed=y)
+
+    return model
+```
+
+For "linear regression with categorical predictors":
+```python
+def build_model(df, features, target):
+    # Handle mixed numeric and categorical features
+    X_list = []
+    is_continuous = []
+
+    for col in features:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            x_col = df[col].values.astype(float)
+            # Check if truly continuous (not binary/categorical codes)
+            is_continuous.append(len(np.unique(x_col)) > 10)
+            X_list.append(x_col)
+        else:
+            # Convert categorical/object to numeric codes
+            X_list.append(df[col].astype('category').cat.codes.values.astype(float))
+            is_continuous.append(False)
+
+    X = np.column_stack(X_list)
+
+    # Standardize only continuous features
+    X_scaled = X.copy()
+    for i, is_cont in enumerate(is_continuous):
+        if is_cont:
+            X_scaled[:, i] = (X[:, i] - X[:, i].mean()) / (X[:, i].std() + 1e-8)
+
+    y = df[target].values.astype(float)
+
+    with pm.Model() as model:
+        alpha = pm.Normal('intercept', mu=0, sigma=2)
+        beta = pm.Normal('coefficients', mu=0, sigma=2, shape=X.shape[1])
+        sigma = pm.HalfNormal('sigma', sigma=1)
+
+        mu = alpha + pm.math.dot(X_scaled, beta)
+        y_obs = pm.Normal('y_obs', mu=mu, sigma=sigma, observed=y)
+
+    return model
+```
+
+For "hierarchical model with group effects":
+```python
+def build_model(df, features, target):
+    # First feature is the grouping variable (categorical)
+    groups = df[features[0]].astype('category').cat.codes.values
+    n_groups = len(df[features[0]].unique())
+
+    # Remaining features are predictors
+    X_list = []
+    is_continuous = []
+
+    for col in features[1:]:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            x_col = df[col].values.astype(float)
+            is_continuous.append(len(np.unique(x_col)) > 10)
+            X_list.append(x_col)
+        else:
+            X_list.append(df[col].astype('category').cat.codes.values.astype(float))
+            is_continuous.append(False)
+
+    X = np.column_stack(X_list) if X_list else np.zeros((len(df), 1))
+
+    # Standardize continuous features
+    X_scaled = X.copy()
+    for i, is_cont in enumerate(is_continuous):
+        if is_cont:
+            X_scaled[:, i] = (X[:, i] - X[:, i].mean()) / (X[:, i].std() + 1e-8)
+
+    y = df[target].values.astype(float)
+
+    with pm.Model() as model:
+        # Hyperpriors (tighter for better convergence)
+        mu_alpha = pm.Normal('mu_alpha', mu=0, sigma=2)
+        sigma_alpha = pm.HalfNormal('sigma_alpha', sigma=2)
+
+        # Group-level intercepts (non-centered parameterization)
+        alpha_offset = pm.Normal('alpha_offset', mu=0, sigma=1, shape=n_groups)
+        alpha = pm.Deterministic('alpha', mu_alpha + alpha_offset * sigma_alpha)
+
+        # Global slopes (tighter priors)
+        beta = pm.Normal('beta', mu=0, sigma=2, shape=X.shape[1])
+
+        # Error
+        sigma = pm.HalfNormal('sigma', sigma=1)
+
+        # Linear model
+        mu = alpha[groups] + pm.math.dot(X_scaled, beta)
+
+        # Likelihood
+        y_obs = pm.Normal('y_obs', mu=mu, sigma=sigma, observed=y)
+
+    return model
+```
+
+IMPORTANT NOTES:
+- DO NOT include import statements - pm, np, pd are pre-imported
+- CRITICAL: PyMC cannot handle object dtypes - ALWAYS convert to numeric:
+  * Use pd.api.types.is_numeric_dtype() to check if numeric
+  * Use .astype('category').cat.codes.values for strings/categoricals
+  * Use .select_dtypes(include=[np.number]) to filter numeric columns
+  * Ensure target is .astype(float) or .astype(int) as appropriate
+- CRITICAL: Standardize continuous features: X_scaled = (X - X.mean()) / X.std()
+  * This is ESSENTIAL for convergence in complex models
+  * Only standardize truly continuous variables (>10 unique values)
+  * Do NOT standardize binary (0/1) or small categorical codes
+- Use tighter priors for standardized data (sigma=2 instead of sigma=10)
+- For hierarchical models, use non-centered parameterization for better sampling
+- For count data, use Poisson or NegativeBinomial likelihoods
+- For binary outcomes, use Bernoulli or Categorical (ensure y is int)
+- Always use X.shape[1] not len(features) for beta shape
+- Return the model object at the end
+
+Remember: Output ONLY the Python code for the function, nothing else. NO imports.
+    """,
+    model=_model_agent_model,
+    output_type=BayesianModelCode | BayesianModelFailure,
     output_retries=3,
 )
 
@@ -325,6 +606,194 @@ def statsmodels_mixedlm_regression(
     """
     df = ctx.deps.get_data(name)
     return try_statsmodels(smf.mixedlm, formula, df, kwargs={"groups": df[group_col]})
+
+
+@agent.tool
+async def fit_bayesian_model(
+    ctx: RunContext[DataStore],
+    name: str,
+    features: list[str],
+    target: str,
+    model_description: str,
+    description: str,
+    n_samples: int = 2000,
+    n_tune: int = 2000,
+    n_chains: int = 4,
+    target_accept: float = 0.95,
+) -> str:
+    """
+    Fit a Bayesian model using PyMC to a dataframe, using natural language to describe the model structure.
+
+    This tool generates PyMC code from your description, validates it for security, executes it safely,
+    and performs MCMC sampling to obtain posterior distributions.
+
+    Usage:
+        - Use this tool when you want probabilistic inference with uncertainty quantification
+        - Ideal for: hierarchical models, regularization via priors, small sample sizes, causal inference
+        - The model_description should clearly specify the model structure, priors, and likelihood
+
+    Args:
+        name: The name of the dataframe to use for modeling
+        features: List of feature column names to use as predictors
+        target: The target variable column name to predict
+        model_description: Natural language description of the Bayesian model structure
+            Examples:
+            - "linear regression with weakly informative normal priors"
+            - "logistic regression with regularizing priors on coefficients"
+            - "hierarchical linear model with varying intercepts by group"
+        description: A description of this analysis to store in the context
+        n_samples: Number of posterior samples to draw (default: 2000)
+        n_tune: Number of tuning/warmup samples (default: 2000, increased for complex models)
+        n_chains: Number of MCMC chains to run (default: 4 for better convergence diagnostics)
+        target_accept: Target acceptance rate for NUTS sampler (default: 0.95, higher = more accurate but slower)
+
+    Returns:
+        str: Metadata and diagnostics for the fitted model, including:
+            - Posterior summary statistics (mean, sd, hdi)
+            - Convergence diagnostics (Rhat, effective sample size)
+            - Information about the stored posterior samples
+
+    Notes:
+        - Results are stored as "{name}_bayesian" containing posterior samples
+        - The tool validates generated code for security before execution
+        - Check Rhat < 1.01 and ESS > 400 for reliable inference
+    """
+    data = ctx.deps.get(name)
+    df = data.df
+    check_columns(df, name, *features, target)
+
+    feature_metadata = [
+        col.model_dump_json() for col in data.context.columns if col.name in features
+    ]
+    target_metadata = [
+        col.model_dump_json() for col in data.context.columns if col.name == target
+    ][0]
+
+    base_prompt = f"""
+    Generate PyMC model code that predicts the target variable '{target}' using features: {features}.
+
+    Feature metadata: {feature_metadata}
+    Target metadata: {target_metadata}
+
+    Model description:
+    {model_description}
+
+    Output ONLY the Python code for the build_model function. Do not include markdown formatting or explanations.
+    """
+
+    max_retries = 3
+    last_error = None
+
+    for attempt in range(max_retries):
+        # Build prompt with error feedback on retry
+        if attempt == 0:
+            prompt = base_prompt
+        else:
+            prompt = f"""
+{base_prompt}
+
+PREVIOUS ATTEMPT FAILED with the following error:
+{last_error}
+
+Please fix the code to address this error. Common fixes:
+- Ensure all features are converted to numeric (use pd.api.types.is_numeric_dtype() to check)
+- Standardize continuous features (len(np.unique(x)) > 10)
+- Use .astype(float) or .astype(int) appropriately
+- Check array shapes before matrix operations
+- Ensure the function returns the model object
+
+Output ONLY the corrected Python code.
+"""
+
+        try:
+            # Generate code
+            result = await bayesian_agent.run(prompt)
+            output = result.output
+
+            if isinstance(output, BayesianModelFailure):
+                last_error = output.explanation
+                continue
+
+            model_code = output.code
+
+            # Validate and execute the code
+            allowed_globals = {"pm": pm, "np": np, "pd": pd}
+            namespace = execute_validated_code(model_code, allowed_globals)
+            build_model_func = namespace.get("build_model")
+
+            if build_model_func is None:
+                last_error = "Generated code did not define 'build_model' function."
+                continue
+
+            # Build the model
+            model = build_model_func(df, features, target)
+
+            # Sample from the posterior with better settings for complex models
+            with model:
+                idata = pm.sample(
+                    draws=n_samples,
+                    tune=n_tune,
+                    chains=n_chains,
+                    target_accept=target_accept,
+                    return_inferencedata=True,
+                )
+
+            # Check convergence
+            summary = az.summary(idata)
+            max_rhat = summary['r_hat'].max()
+            min_ess = summary['ess_bulk'].min()
+
+            convergence_warnings = []
+            if max_rhat > 1.0:
+                convergence_warnings.append(
+                    f"WARNING: Poor convergence detected. Max R-hat = {max_rhat:.3f} (should be < 1.01). "
+                    "The chains have not converged. Consider: (1) increasing n_tune, (2) standardizing features, "
+                    "(3) using tighter priors, or (4) simplifying the model."
+                )
+            if min_ess < 400:
+                convergence_warnings.append(
+                    f"WARNING: Low effective sample size. Min ESS = {min_ess:.0f} (should be > 400). "
+                    "Posterior estimates may be unreliable. Consider increasing n_samples or n_chains."
+                )
+
+            if convergence_warnings:
+                warning_msg = "\n\n".join(convergence_warnings)
+                raise ModelRetry(
+                    f"Bayesian model sampling completed but convergence diagnostics failed:\n\n{warning_msg}\n\n"
+                    "Please retry with better settings or a simpler model."
+                )
+
+            # Extract posterior samples as dataframe
+            posterior_df = az.extract(idata, num_samples=500).to_dataframe().reset_index()
+
+            # Success! Store results and return
+            bayesian_data = ctx.deps.store_bayesian(
+                df=posterior_df,
+                name=f"{name}_bayesian",
+                description=description,
+                input_data=name,
+                model_code=model_code,
+                idata=idata,
+            )
+
+            return bayesian_data.get_context()
+
+        except ModelRetry:
+            # Convergence issues should bubble up immediately - caller can decide to retry with better params
+            raise
+        except Exception as e:
+            last_error = str(e)
+            logfire.error("Error fitting Bayesian model: {e}", e=e)
+            if attempt < max_retries - 1:
+                # Try again with error feedback
+                continue
+            else:
+                # Final attempt failed
+                raise ModelRetry(
+                    f"Error fitting Bayesian model after {max_retries} attempts. "
+                    f"Last error: {last_error}. "
+                    f"Please check your model description and try again."
+                )
 
 
 @agent.tool(retries=3)

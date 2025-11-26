@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Annotated, Iterator, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Iterator, Literal, Self
 
 from pydantic import BaseModel, Field
 from pydantic_ai import ModelRetry
@@ -9,6 +9,9 @@ import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
 from sklearn.base import BaseEstimator
+
+if TYPE_CHECKING:
+    import arviz as az
 
 type ColumnDescription = Annotated[
     NumberColumnDescription | CategoricalColumnDescription | DatetimeColumnDescription,
@@ -205,7 +208,58 @@ The stored dataframe are the predictions of the model, with this metadata:
         return context_str
 
 
-type StoredDataframe = StaticData | SQLData | ModelData
+@dataclass
+class BayesianData(_BaseData):
+    input_data: str
+    model_code: str
+    idata: "az.InferenceData"
+    summary: pd.DataFrame
+
+    @classmethod
+    def from_df(
+        cls,
+        df: pd.DataFrame,
+        name: str,
+        description: str,
+        input_data: str,
+        model_code: str,
+        idata: "az.InferenceData",
+    ) -> Self:
+        import arviz as az
+
+        summary = az.summary(idata)
+        return cls(
+            df=df,
+            context=DataframeContext.from_df(df),
+            name=name,
+            description=description,
+            input_data=input_data,
+            model_code=model_code,
+            idata=idata,
+            summary=summary,
+        )
+
+    def get_context(self) -> str:
+        context_str = f"""
+Bayesian model fitted to the following dataframe with this metadata:
+Input dataframe: {self.input_data}
+Model code:
+{self.model_code}
+
+Posterior summary statistics:
+{self.summary.to_string()}
+
+Diagnostics:
+- All Rhat values should be < 1.01 for convergence
+- ESS (effective sample size) should be > 400 for reliable inference
+
+The stored dataframe contains posterior samples with this metadata:
+{self._base_context()}
+        """
+        return context_str
+
+
+type StoredDataframe = StaticData | SQLData | ModelData | BayesianData
 
 
 @dataclass
@@ -265,6 +319,19 @@ class DataStore:
         model: BaseEstimator,
     ) -> ModelData:
         data = ModelData.from_df(df, name, description, input_data, model)
+        self.data[name] = data
+        return data
+
+    def store_bayesian(
+        self,
+        df: pd.DataFrame,
+        name: str,
+        description: str,
+        input_data: str,
+        model_code: str,
+        idata: "az.InferenceData",
+    ) -> BayesianData:
+        data = BayesianData.from_df(df, name, description, input_data, model_code, idata)
         self.data[name] = data
         return data
 

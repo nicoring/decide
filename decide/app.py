@@ -17,7 +17,7 @@ from pydantic_ai.messages import (
 import pandas as pd
 
 from decide.agent import agent
-from decide.storage import DataStore, ModelData, SQLData
+from decide.storage import BayesianData, DataStore, ModelData, SQLData
 
 
 class SessionState:
@@ -151,6 +151,12 @@ def build_data_viewer() -> None:
                     st.write("Input: " + data.input_data)
                     with st.expander("🔍 View Model"):
                         st.code(str(data.model))
+                case BayesianData():
+                    st.write("Input: " + data.input_data)
+                    with st.expander("🔍 View Model Code"):
+                        st.code(data.model_code, language="python")
+                    with st.expander("📊 View Posterior Summary"):
+                        st.dataframe(data.summary)
 
             st.dataframe(data.df, width="stretch")
 
